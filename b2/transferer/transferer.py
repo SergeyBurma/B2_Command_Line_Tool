@@ -9,6 +9,7 @@
 ######################################################################
 
 import six
+import time
 
 from ..download_dest import DownloadDestProgressWrapper
 from ..exception import ChecksumMismatch, UnexpectedCloudBehaviour, TruncatedOutput, InvalidRange
@@ -73,43 +74,68 @@ class Transferer(object):
             range_=range_,
         ) as response:
             metadata = FileMetadata.from_response(response)
-            if range_ is not None:
-                if 'Content-Range' not in response.headers:
-                    raise UnexpectedCloudBehaviour('Content-Range header was expected')
-                if (range_[1] - range_[0] + 1) != metadata.content_length:
-                    raise InvalidRange(metadata.content_length, range_)
-
-            mod_time_millis = int(
-                metadata.file_info.get(
-                    SRC_LAST_MODIFIED_MILLIS,
-                    response.headers['x-bz-upload-timestamp'],
-                )
+            content_length = metadata.content_length
+        mod_time_millis = int(
+            metadata.file_info.get(
+                SRC_LAST_MODIFIED_MILLIS,
+                response.headers['x-bz-upload-timestamp'],
             )
+        )
 
-            with download_dest.make_file_context(
-                metadata.file_id,
-                metadata.file_name,
-                metadata.content_length,
-                metadata.content_type,
-                metadata.content_sha1,
-                metadata.file_info,
-                mod_time_millis,
-                range_=range_,
-            ) as file:
+        with download_dest.make_file_context(
+            metadata.file_id,
+            metadata.file_name,
+            metadata.content_length,
+            metadata.content_type,
+            metadata.content_sha1,
+            metadata.file_info,
+            mod_time_millis,
+            range_=range_,
+        ) as file:
+            chunk_num = 0
+            chunk_size = 1024 * 1024
+            while(True):
+                start = chunk_size * chunk_num
+                if start >= content_length:
+                    break
+                end = chunk_size * (chunk_num + 1) - 1
+                if end >= content_length:
+                    end = content_length - 1
+                chunk_range_ = start, end
+                with self.session.download_file_from_url(
+                    url,
+                    url_factory=self.account_info.get_download_url,
+                    range_=chunk_range_,
+                ) as response:
+                    metadata = FileMetadata.from_response(response)
+                    if chunk_range_ is not None:
+                        if 'Content-Range' not in response.headers:
+                            raise UnexpectedCloudBehaviour('Content-Range header was expected')
+                        if (chunk_range_[1] - chunk_range_[0] + 1) != metadata.content_length:
+                            raise InvalidRange(metadata.content_length, chunk_range_)
 
-                for strategy in self.strategies:
-                    if strategy.is_suitable(metadata, progress_listener):
-                        bytes_read, actual_sha1 = strategy.download(
-                            file, response, metadata, self.session
-                        )
-                        break
-                else:
-                    assert False, 'no strategy suitable for download was found!'
-
-                self._validate_download(
-                    range_, bytes_read, actual_sha1, metadata
-                )  # raises exceptions
-                return metadata.as_info_dict()
+                    file.seek(chunk_range_[0])
+                    for strategy in self.strategies:
+                        if strategy.is_suitable(metadata, progress_listener):
+                            # import pudb; pu.db
+                            bytes_read, actual_sha1 = strategy.download(
+                                file, response, metadata, self.session
+                            )
+                            break
+                    else:
+                        assert False, 'no strategy suitable for download was found!'
+                    try:
+                        self._validate_download(
+                            chunk_range_, bytes_read, actual_sha1, metadata
+                        )  # raises exceptions
+                    except (ChecksumMismatch, TruncatedOutput) as e:
+                        print('Chunk {} error: {}. Retrying'.format(
+                            chunk_num, str(e)
+                        ))
+                        time.sleep(1)
+                        continue
+                chunk_num += 1
+        return metadata.as_info_dict()
 
     def _validate_download(self, range_, bytes_read, actual_sha1, metadata):
         if range_ is None:
