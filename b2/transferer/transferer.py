@@ -109,7 +109,7 @@ class Transferer(object):
                 ) as response:
                     metadata = FileMetadata.from_response(response)
                     if chunk_range_ is not None:
-                        if 'Content-Range' not in response.headers:
+                        if 'Content-Range' not in response.headers and int(response.headers.get('Content-Length', chunk_size)) >= chunk_size:
                             raise UnexpectedCloudBehaviour('Content-Range header was expected')
                         if (chunk_range_[1] - chunk_range_[0] + 1) != metadata.content_length:
                             raise InvalidRange(metadata.content_length, chunk_range_)
